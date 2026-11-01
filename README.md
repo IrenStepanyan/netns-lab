@@ -1,119 +1,46 @@
-# netns-lab
-
-A small networking lab that uses Linux **network namespaces** and a **veth pair**
-to simulate two isolated machines on one computer, then sends data between them
-over a plain TCP socket, written in C.
-
-This is the first stage of a larger project. The plan is to grow this into a
-**4-node pipeline**:
+# netns-lab v2 (C): secure inline TCP payload channel (DH + AES-256-GCM)
 
 ```
-sender  --->  encrypt  --->  decrypt  --->  receiver
+ PC1 --eth0 [ D1 ] eth1 ==== [ MITM ] ==== eth0 [ D2 ] eth1-- PC2
+10.0.0.1     encrypt   192.168.100.1   sniff/tamper/replay   192.168.100.2   decrypt   10.0.0.2
 ```
 
-Each stage will live in its own network namespace, connected by veth pairs,
-so the setup mirrors real network hops rather than just function calls in one
-process.
+## Files
+| File | Role |
+|---|---|
+| `src/pkt.c/.h` | Ethernet/IPv4/TCP parsing, frame rebuild, IP+TCP checksum recalculation, AF_PACKET socket helper |
+| `src/dh.c/.h` | Diffie-Hellman (RFC 3526 group 14, OpenSSL BIGNUM), PSK-authenticated handshake, HKDF-SHA256 |
+| `src/device.c` | D1/D2: AES-256-GCM encrypt/decrypt of the TCP payload, anti-replay window, forwarding loop |
+| `src/mitm.c` | attacker box: `pass`, `flip` (corrupt 1 in 20 frames), `replay` (duplicate every frame) |
+| `src/sendfile.c`, `src/recvfile.c` | plain TCP file sender (PC1) / receiver (PC2) |
+| `scripts/*.sh` | lab build (netns + veth), teardown, automatic demo |
 
-## Current stage: sender <-> receiver (no encryption)
-
+## Build and run
+```bash
+sudo apt install -y build-essential libssl-dev iproute2 ethtool tcpdump
+make                                  # -> build/device build/mitm build/sendfile build/recvfile
+sudo scripts/setup_lab.sh             # 5 namespaces, 4 veth pairs, MTU 1600 on D1<->D2, offloads off
+sudo scripts/demo.sh pass             # 3 MB file, sha256 compared
+sudo scripts/demo.sh flip             # "[drop] bad authentication tag"
+sudo scripts/demo.sh replay           # "[drop] replay/too old"
+sudo scripts/teardown_lab.sh
 ```
-ns_sender (10.0.0.1) <---veth pair---> ns_receiver (10.0.0.2)
+Manual (one terminal each; start D2 before D1; PSK must match):
+```bash
+sudo ip netns exec mitm build/mitm --mode pass
+sudo ip netns exec mitm tcpdump -n -i eth1 -X "tcp port 5001"
+sudo ip netns exec d2 build/device --role d2 --lan-if eth1 --wan-if eth0 --listen-ip 192.168.100.2 --port 5001 --psk lab-secret -v
+sudo ip netns exec d1 build/device --role d1 --lan-if eth0 --wan-if eth1 --peer-ip 192.168.100.2 --port 5001 --psk lab-secret -v
+sudo ip netns exec pc2 build/recvfile out.bin 5001
+sudo ip netns exec pc1 build/sendfile in.bin 10.0.0.2 5001
+sha256sum in.bin out.bin
 ```
 
-## Requirements
+## Protocol summary
+* Handshake over a normal TCP connection D1->D2 (port 9000): nonces + DH public values authenticated with HMAC-SHA256(PSK), keys = HKDF-SHA256(shared, salt = SHA256(transcript)), then key confirmation.
+* Data path: only TCP segments with payload on `--port`. Wire payload = `ciphertext | tag(16) | counter(8)`; nonce = 4-byte salt || counter; separate key and salt per direction; counter strictly increasing so no (key, nonce) reuse, retransmissions included.
+* AAD = src IP, dst IP, sport, dport, seq, ack. Receiver drops anything that fails the tag or the 1024-entry replay window (fail closed).
+* IP total length +24, IP header checksum and TCP checksum recomputed on both devices.
 
-- Linux with `iproute2` (`ip` command) - installed by default on most distros
-- `gcc` (or any C compiler)
-- `sudo` privileges (creating namespaces and interfaces requires root)
-
-## Project structure
-
-```
-netns-lab/
-├── setup_netns.sh     # creates the namespaces + veth pair, assigns IPs
-├── cleanup_netns.sh   # tears everything down
-├── sender.c           # runs inside ns_sender, connects and sends a message
-├── receiver.c         # runs inside ns_receiver, listens and prints the message
-└── README.md
-```
-
-## How to run
-
-1. **Create the virtual network:**
-
-   ```bash
-   chmod +x setup_netns.sh cleanup_netns.sh
-   sudo ./setup_netns.sh
-   ```
-
-   This creates `ns_sender` (10.0.0.1/24) and `ns_receiver` (10.0.0.2/24),
-   links them with a veth pair, brings the interfaces up, and pings between
-   them to confirm connectivity.
-
-2. **Compile both programs:**
-
-   ```bash
-   gcc -Wall -o receiver receiver.c
-   gcc -Wall -o sender sender.c
-   ```
-
-3. **Start the receiver** (in one terminal):
-
-   ```bash
-   sudo ip netns exec ns_receiver ./receiver
-   ```
-
-   It will print `Listening on 10.0.0.2:5000 ...` and wait.
-
-4. **Run the sender** (in a second terminal):
-
-   ```bash
-   sudo ip netns exec ns_sender ./sender
-   ```
-
-   Expected output:
-
-   ```
-   [sender] Connected to 10.0.0.2:5000
-   [sender] Sent: Hello from sender namespace!
-   ```
-
-   And on the receiver side:
-
-   ```
-   [receiver] Connection established from 10.0.0.1:<port>
-   [receiver] Received: Hello from sender namespace!
-   ```
-
-5. **Clean up** when done:
-
-   ```bash
-   sudo ./cleanup_netns.sh
-   ```
-
-## How it works
-
-- **Network namespace** - an isolated copy of the Linux network stack (its
-  own interfaces, IP addresses, routing table). Processes inside a namespace
-  can only see the network devices that belong to it.
-- **veth pair** - two virtual Ethernet interfaces linked like two ends of a
-  cable; whatever goes in one comes out the other. Putting one end in each
-  namespace creates a private point-to-point link between them.
-- **Sockets (C, POSIX API)** - `sender.c` and `receiver.c` use the standard
-  BSD socket API (`<sys/socket.h>`, `<arpa/inet.h>`): the receiver `bind()`s
-  to an address, `listen()`s, and `accept()`s a connection; the sender
-  `connect()`s to the receiver's address and `send()`s bytes over the link.
-
-## Roadmap
-
-- [ ] Add `encrypt` and `decrypt` namespaces between sender and receiver
-- [ ] Chain all four namespaces with veth pairs (or a bridge) so traffic
-      flows sender -> encrypt -> decrypt -> receiver
-- [ ] Swap the placeholder "no encryption" step for a real cipher
-      (e.g. AES) once the pipeline topology is working
-- [ ] Optional: add a script that automates the full multi-namespace setup
-
-## License
-
-MIT (or your choice)
+## Limits
+IPv4 only, no fragments/VLAN, no rekeying (session ends at 2^40 packets), PSK instead of certificates, one handshake per process start.
