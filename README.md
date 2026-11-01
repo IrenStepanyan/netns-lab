@@ -1,4 +1,4 @@
-# netns-lab v2 (C): secure inline TCP payload channel (DH + AES-256-GCM)
+# netns-lab
 
 ```
  PC1 --eth0 [ D1 ] eth1 ==== [ MITM ] ==== eth0 [ D2 ] eth1-- PC2
